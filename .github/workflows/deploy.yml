@@ -43,34 +43,40 @@ jobs:
           button:disabled{opacity:.5;cursor:default}
           input[type=file]{display:none}
           input[type=range]{width:100%;accent-color:var(--acc)}
+          input[type=text]{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);font:inherit}
           .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
           .out{overflow-x:auto}
           canvas{max-width:100%;height:auto;border-radius:8px;display:block}
           </style></head><body><main>
           <h1>Internet Photo Mosaic</h1>
-          <p class="s">Upload a photo. The app grabs random images from Wikimedia Commons and rebuilds your photo out of them.</p>
+          <p class="s">Upload a photo and rebuild it out of images from the internet.</p>
 
           <div class="card">
-          <div class="row">
+          <div class="m" style="margin-bottom:6px">What should the tiles be? (leave empty for random)</div>
+          <input id="q" type="text" placeholder="e.g. cats, flowers, space, food" autocomplete="off">
+          <div class="row" style="margin-top:12px">
           <label class="b">Choose photo<input id="src" type="file" accept="image/*"></label>
           <button id="go" disabled>Make mosaic</button>
+          <button id="nw" class="g" disabled>New images</button>
           <button id="dl" class="g" disabled>Download PNG</button>
           </div>
           </div>
 
           <div class="card">
-          <div class="m">Tiles across: <b id="tv">150</b> <span id="tc"></span></div>
-          <input id="tn" type="range" min="16" max="400" value="150">
-          <div class="m" style="margin-top:8px">Random images to fetch: <b id="pv">400</b></div>
-          <input id="pn" type="range" min="60" max="800" step="20" value="400">
+          <div class="m">Tiles across: <b id="tv">100</b> <span id="tc"></span></div>
+          <input id="tn" type="range" min="16" max="400" value="100">
+          <div class="m" style="margin-top:8px">Images to fetch: <b id="pv">200</b></div>
+          <input id="pn" type="range" min="60" max="800" step="10" value="200">
           </div>
 
           <div class="card out"><canvas id="out" width="1" height="1"></canvas><p class="m" id="st">Waiting for a photo…</p></div>
 
           <script>
           const $=id=>document.getElementById(id);
-          const T=32;
-          let srcImg=null,pool=[];
+          const T=24,WORKERS=5;
+          const WORDS=['nature','city','flowers','animals','food','ocean','mountains','architecture','sky','forest','street','art','birds','cars','sunset','garden','market','bridge','desert','winter'];
+          let srcImg=null,pool=[],poolKey=null;
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
           function upd(){
             const c=+$('tn').value;$('tv').textContent=c;
@@ -79,10 +85,11 @@ jobs:
           }
           $('tn').oninput=upd;
           $('pn').oninput=()=>$('pv').textContent=$('pn').value;
+          $('q').onkeydown=e=>{if(e.key==='Enter'&&srcImg){e.preventDefault();run()}};
           $('src').onchange=e=>{
             const f=e.target.files[0];if(!f)return;
             const i=new Image();
-            i.onload=()=>{srcImg=i;$('go').disabled=false;$('st').textContent='Photo loaded. Tap "Make mosaic".';upd()};
+            i.onload=()=>{srcImg=i;$('go').disabled=false;$('nw').disabled=false;$('st').textContent='Photo loaded. Tap "Make mosaic".';upd()};
             i.src=URL.createObjectURL(f);
           };
           upd();
@@ -90,63 +97,105 @@ jobs:
           function mk(){const c=document.createElement('canvas');c.width=c.height=T;return c}
           function avg(c){const d=c.getContext('2d').getImageData(0,0,T,T).data;let r=0,g=0,b=0,n=T*T;for(let i=0;i<d.length;i+=4){r+=d[i];g+=d[i+1];b+=d[i+2]}return[r/n,g/n,b/n]}
 
-          async function fetchBatch(){
-            const u='https://commons.wikimedia.org/w/api.php?action=query&generator=random&grnnamespace=6&grnlimit=50&grnfilterredir=nonredirects'
-              +'&prop=imageinfo&iiprop=url|mime&iiurlwidth=96&format=json&origin=*&rnd='+Date.now()+'-'+Math.random();
+          function loadTile(url,src){
+            return new Promise(res=>{
+              const im=new Image();
+              let done=false;
+              const fin=v=>{if(!done){done=true;res(v)}};
+              const to=setTimeout(()=>{im.src='';fin(null)},6000);
+              im.crossOrigin='anonymous';
+              im.onload=()=>{
+                clearTimeout(to);
+                try{
+                  const c=mk(),x=c.getContext('2d'),s=Math.min(im.width,im.height);
+                  x.drawImage(im,(im.width-s)/2,(im.height-s)/2,s,s,0,0,T,T);
+                  fin({c,a:avg(c),src});
+                }catch(e){fin(null)}
+              };
+              im.onerror=()=>{clearTimeout(to);fin(null)};
+              im.src=url;
+            });
+          }
+
+          // Commons: search when there's a query, random otherwise
+          async function commonsBatch(q,offset){
+            const base='https://commons.wikimedia.org/w/api.php?action=query&grnnamespace=6&prop=imageinfo&iiprop=url|mime&iiurlwidth=60&format=json&origin=*';
+            const u=q
+              ?base.replace('&grnnamespace=6','')+'&generator=search&gsrnamespace=6&gsrlimit=50&gsroffset='+offset+'&gsrsearch='+encodeURIComponent(q+' filetype:bitmap')
+              :base+'&generator=random&grnlimit=50&grnfilterredir=nonredirects&rnd='+Date.now()+'-'+Math.random();
             const r=await fetch(u,{cache:'no-store'});
-            if(!r.ok)throw new Error('API '+r.status);
+            if(!r.ok)throw new Error('Commons '+r.status);
             const j=await r.json();
             const pages=Object.values((j.query&&j.query.pages)||{});
             return pages.map(p=>p.imageinfo&&p.imageinfo[0]).filter(i=>i&&i.mime==='image/jpeg'&&i.thumburl).map(i=>i.thumburl);
           }
 
-          function loadTile(url){
-            return new Promise(res=>{
-              const im=new Image();
-              im.crossOrigin='anonymous';
-              im.onload=()=>{
-                try{
-                  const c=mk(),x=c.getContext('2d'),s=Math.min(im.width,im.height);
-                  x.drawImage(im,(im.width-s)/2,(im.height-s)/2,s,s,0,0,T,T);
-                  res({c,a:avg(c)});
-                }catch(e){res(null)}
-              };
-              im.onerror=()=>res(null);
-              im.src=url;
-            });
-          }
-
-          async function fillPool(target){
+          async function fillPool(target,q){
             pool=[];
             const seen=new Set();
-            let fails=0,empty=0;
-            while(pool.length<target&&fails<4&&empty<8){
-              try{
-                const urls=(await fetchBatch()).filter(u=>!seen.has(u));
-                urls.forEach(u=>seen.add(u));
-                if(!urls.length){empty++;continue}
-                const tiles=(await Promise.all(urls.map(loadTile))).filter(Boolean);
-                pool.push(...tiles);
-                $('st').textContent=`Fetching random images… ${pool.length}/${target}`;
-              }catch(e){fails++;console.error(e)}
+            const t0=performance.now();
+            const status=m=>{$('st').textContent=`${m} ${Math.min(pool.length,target)}/${target} (${Math.round((performance.now()-t0)/1000)}s)`};
+
+            // Phase 1: Openverse (20 per request, about 1 request per second when anonymous)
+            let ovOk=true,ovMsg='';
+            const words=q?[q]:WORDS.slice().sort(()=>Math.random()-.5).slice(0,6);
+            for(const w of words){
+              if(!ovOk||pool.length>=target)break;
+              for(let p=1;p<=5&&pool.length<target;p++){
+                try{
+                  const r=await fetch('https://api.openverse.org/v1/images/?q='+encodeURIComponent(w)+'&page_size=20&page='+p+'&mature=false');
+                  if(!r.ok){ovOk=false;ovMsg='Openverse said '+r.status;break}
+                  const j=await r.json();
+                  const res=j.results||[];
+                  if(!res.length)break;
+                  const urls=res.map(x=>x.thumbnail||x.url).filter(u=>u&&!seen.has(u));
+                  urls.forEach(u=>seen.add(u));
+                  const tiles=(await Promise.all(urls.map(u=>loadTile(u,'ov')))).filter(Boolean);
+                  pool.push(...tiles);
+                  status('Openverse…');
+                  if(p===1&&!tiles.length&&urls.length){ovOk=false;ovMsg='Openverse images blocked by the browser';break}
+                  await sleep(1100);
+                }catch(e){ovOk=false;ovMsg='Openverse unreachable';break}
+              }
             }
-            if(pool.length<20)throw new Error('Could not fetch enough images from Wikimedia Commons. Check your connection and try again.');
+
+            // Phase 2: Commons fills whatever is left
+            if(pool.length<target){
+              let fails=0,empty=0,offset=0;
+              const worker=async()=>{
+                while(pool.length<target&&fails<8&&empty<12){
+                  try{
+                    const off=offset;offset+=50;
+                    const urls=(await commonsBatch(q,off)).filter(u=>!seen.has(u));
+                    urls.forEach(u=>seen.add(u));
+                    if(!urls.length){empty++;continue}
+                    const tiles=(await Promise.all(urls.map(u=>loadTile(u,'wc')))).filter(Boolean);
+                    pool.push(...tiles);
+                    status(ovMsg?ovMsg+'. Using Wikimedia Commons…':'Adding Wikimedia Commons…');
+                  }catch(e){fails++;console.error(e)}
+                }
+              };
+              await Promise.all(Array.from({length:WORKERS},worker));
+            }
+            if(pool.length<20)throw new Error('Could not find enough images'+(q?' for "'+q+'". Try a broader search word.':'. Check your connection and try again.'));
           }
 
-          $('go').onclick=async()=>{
+          async function run(force){
             if(!srcImg)return;
-            $('go').disabled=true;$('dl').disabled=true;
+            $('go').disabled=true;$('nw').disabled=true;$('dl').disabled=true;
             try{
-              await fillPool(+$('pn').value);
+              const q=$('q').value.trim().toLowerCase(),target=+$('pn').value,key=q;
+              if(force||key!==poolKey||pool.length<target){await fillPool(target,q);poolKey=key}
               await draw();
-            }catch(e){$('st').textContent=e.message;console.error(e)}
-            $('go').disabled=false;
-          };
+            }catch(e){$('st').textContent=e.message;console.error(e);poolKey=null}
+            $('go').disabled=false;$('nw').disabled=false;
+          }
+          $('go').onclick=()=>run(false);
+          $('nw').onclick=()=>run(true);
 
           async function draw(){
             const cols=+$('tn').value,rows=Math.max(1,Math.round(cols*srcImg.height/srcImg.width));
             const cells=cols*rows;
-            // keep the output canvas under ~16 million pixels so phones can handle it
             const CS=Math.max(4,Math.min(20,Math.floor(Math.sqrt(16e6/cells))));
             const s=document.createElement('canvas');s.width=cols;s.height=rows;
             const sx=s.getContext('2d');sx.imageSmoothingQuality='high';sx.drawImage(srcImg,0,0,cols,rows);
@@ -157,33 +206,47 @@ jobs:
             const A=new Float32Array(n*3);
             pool.forEach((t,k)=>{A[k*3]=t.a[0];A[k*3+1]=t.a[1];A[k*3+2]=t.a[2]});
             const uses=new Int32Array(n);
-            const pen=1152/(cells/n); // spreads usage across many different images
+
+            const K=Math.min(6,n),cache=new Map();
+            function cand(r,g,b){
+              const key=((r>>4)<<8)|((g>>4)<<4)|(b>>4);
+              let c=cache.get(key);
+              if(c)return c;
+              const cr=(r>>4)*16+8,cg=(g>>4)*16+8,cb=(b>>4)*16+8;
+              const ds=new Array(K).fill(1e18),ids=new Array(K).fill(0);
+              for(let k=0;k<n;k++){
+                const dr=A[k*3]-cr,dg=A[k*3+1]-cg,db=A[k*3+2]-cb;
+                const d=dr*dr+dg*dg+db*db;
+                if(d<ds[K-1]){
+                  let j=K-1;
+                  while(j>0&&ds[j-1]>d){ds[j]=ds[j-1];ids[j]=ids[j-1];j--}
+                  ds[j]=d;ids[j]=k;
+                }
+              }
+              cache.set(key,ids);
+              return ids;
+            }
+
+            let tm=performance.now();
             for(let y=0;y<rows;y++){
               for(let x=0;x<cols;x++){
                 const i=(y*cols+x)*4,r=px[i],g=px[i+1],b=px[i+2];
-                let b0=1e18,b1=1e18,b2=1e18,i0=0,i1=0,i2=0;
-                for(let k=0;k<n;k++){
-                  const dr=A[k*3]-r,dg=A[k*3+1]-g,db=A[k*3+2]-b;
-                  const d=dr*dr+dg*dg+db*db+pen*uses[k];
-                  if(d<b2){
-                    if(d<b1){
-                      b2=b1;i2=i1;
-                      if(d<b0){b1=b0;i1=i0;b0=d;i0=k}else{b1=d;i1=k}
-                    }else{b2=d;i2=k}
-                  }
-                }
-                const pick=[i0,i1,i2][Math.floor(Math.random()*3)];
+                const c=cand(r,g,b);
+                const pick=c[(Math.random()*K)|0];
                 uses[pick]++;
                 ox.drawImage(pool[pick].c,x*CS,y*CS,CS,CS);
                 ox.fillStyle=`rgba(${r},${g},${b},.28)`;ox.fillRect(x*CS,y*CS,CS,CS);
               }
-              if(y%4===0){
+              if(performance.now()-tm>50){
                 $('st').textContent=`Building… ${Math.round(y/rows*100)}%`;
-                await new Promise(r=>setTimeout(r));
+                await sleep(0);
+                tm=performance.now();
               }
             }
-            let used=0;for(let k=0;k<n;k++)if(uses[k])used++;
-            $('st').textContent=`Done: ${cells.toLocaleString()} tiles using ${used} different random images (${o.width}×${o.height}px).`;
+            let used=0,ov=0,wc=0;
+            for(let k=0;k<n;k++){if(uses[k]){used++}}
+            pool.forEach(t=>{if(t.src==='ov')ov++;else wc++});
+            $('st').textContent=`Done: ${cells.toLocaleString()} tiles using ${used} different images (${ov} from Openverse, ${wc} from Wikimedia Commons in the pool). ${o.width}×${o.height}px.`;
             $('dl').disabled=false;
           }
           $('dl').onclick=()=>{
