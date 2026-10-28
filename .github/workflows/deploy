@@ -1,0 +1,167 @@
+name: Build and deploy mosaic app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Generate the site
+        run: |
+          mkdir site
+          cat > site/index.html <<'EOF_HTML'
+          <!DOCTYPE html>
+          <html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Internet Photo Mosaic</title>
+          <style>
+          :root{--bg:#faf8f5;--card:#fff;--fg:#1d1b18;--mut:#6f6a62;--acc:#d9531e;--bd:#e4dfd7}
+          @media (prefers-color-scheme:dark){:root{--bg:#161512;--card:#211f1b;--fg:#f1ede6;--mut:#a09a8f;--acc:#ff7a45;--bd:#37332c;color-scheme:dark}}
+          *{box-sizing:border-box}
+          body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+          main{max-width:760px;margin:0 auto;padding:20px 16px 40px}
+          h1{font-size:1.6rem;margin:0 0 4px}
+          .s,.m{color:var(--mut)}
+          .card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:14px}
+          label.b,button{display:inline-block;background:var(--acc);color:#fff;border:0;border-radius:10px;padding:10px 14px;font:inherit;font-weight:600;cursor:pointer}
+          button.g{background:transparent;color:var(--fg);border:1px solid var(--bd)}
+          button:disabled{opacity:.5;cursor:default}
+          input[type=file]{display:none}
+          input[type=range]{width:100%;accent-color:var(--acc)}
+          .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+          .out{overflow-x:auto}
+          canvas{max-width:100%;height:auto;border-radius:8px;display:block}
+          </style></head><body><main>
+          <h1>Internet Photo Mosaic</h1>
+          <p class="s">Upload a photo. The app grabs random images from Wikimedia Commons and rebuilds your photo out of them.</p>
+
+          <div class="card">
+          <div class="row">
+          <label class="b">Choose photo<input id="src" type="file" accept="image/*"></label>
+          <button id="go" disabled>Make mosaic</button>
+          <button id="dl" class="g" disabled>Download PNG</button>
+          </div>
+          </div>
+
+          <div class="card">
+          <div class="m">Tiles across: <b id="tv">48</b></div>
+          <input id="tn" type="range" min="16" max="100" value="48">
+          <div class="m" style="margin-top:8px">Random images to fetch: <b id="pv">200</b></div>
+          <input id="pn" type="range" min="60" max="500" step="20" value="200">
+          </div>
+
+          <div class="card out"><canvas id="out" width="1" height="1"></canvas><p class="m" id="st">Waiting for a photo…</p></div>
+
+          <script>
+          const $=id=>document.getElementById(id);
+          const T=32,CS=20;
+          let srcImg=null,pool=[];
+
+          $('tn').oninput=()=>$('tv').textContent=$('tn').value;
+          $('pn').oninput=()=>$('pv').textContent=$('pn').value;
+          $('src').onchange=e=>{
+            const f=e.target.files[0];if(!f)return;
+            const i=new Image();
+            i.onload=()=>{srcImg=i;$('go').disabled=false;$('st').textContent='Photo loaded. Tap "Make mosaic".'};
+            i.src=URL.createObjectURL(f);
+          };
+
+          function mk(){const c=document.createElement('canvas');c.width=c.height=T;return c}
+          function avg(c){const d=c.getContext('2d').getImageData(0,0,T,T).data;let r=0,g=0,b=0,n=T*T;for(let i=0;i<d.length;i+=4){r+=d[i];g+=d[i+1];b+=d[i+2]}return[r/n,g/n,b/n]}
+
+          // Ask Commons for a batch of random JPEG files (thumbnails ~96px wide)
+          async function fetchBatch(){
+            const u='https://commons.wikimedia.org/w/api.php?action=query&generator=random&grnnamespace=6&grnlimit=50'
+              +'&prop=imageinfo&iiprop=url|mime&iiurlwidth=96&format=json&origin=*';
+            const r=await fetch(u);
+            if(!r.ok)throw new Error('API '+r.status);
+            const j=await r.json();
+            const pages=Object.values((j.query&&j.query.pages)||{});
+            return pages.map(p=>p.imageinfo&&p.imageinfo[0]).filter(i=>i&&i.mime==='image/jpeg'&&i.thumburl).map(i=>i.thumburl);
+          }
+
+          function loadTile(url){
+            return new Promise(res=>{
+              const im=new Image();
+              im.crossOrigin='anonymous';
+              im.onload=()=>{
+                try{
+                  const c=mk(),x=c.getContext('2d'),s=Math.min(im.width,im.height);
+                  x.drawImage(im,(im.width-s)/2,(im.height-s)/2,s,s,0,0,T,T);
+                  res({c,a:avg(c)});
+                }catch(e){res(null)}
+              };
+              im.onerror=()=>res(null);
+              im.src=url;
+            });
+          }
+
+          async function fillPool(target){
+            pool=[];
+            let fails=0;
+            while(pool.length<target&&fails<4){
+              try{
+                const urls=await fetchBatch();
+                const tiles=(await Promise.all(urls.map(loadTile))).filter(Boolean);
+                pool.push(...tiles);
+                $('st').textContent=`Fetching random images… ${pool.length}/${target}`;
+              }catch(e){fails++;console.error(e)}
+            }
+            if(pool.length<20)throw new Error('Could not fetch enough images from Wikimedia Commons. Check your connection and try again.');
+          }
+
+          $('go').onclick=async()=>{
+            if(!srcImg)return;
+            $('go').disabled=true;$('dl').disabled=true;
+            try{
+              await fillPool(+$('pn').value);
+              draw();
+            }catch(e){$('st').textContent=e.message}
+            $('go').disabled=false;
+          };
+
+          function draw(){
+            const cols=+$('tn').value,rows=Math.max(1,Math.round(cols*srcImg.height/srcImg.width));
+            const s=document.createElement('canvas');s.width=cols;s.height=rows;
+            const sx=s.getContext('2d');sx.drawImage(srcImg,0,0,cols,rows);
+            const px=sx.getImageData(0,0,cols,rows).data;
+            const o=$('out');o.width=cols*CS;o.height=rows*CS;
+            const ox=o.getContext('2d');
+            const last=new Array(cols).fill(-1);
+            for(let y=0;y<rows;y++)for(let x=0;x<cols;x++){
+              const i=(y*cols+x)*4,r=px[i],g=px[i+1],b=px[i+2];
+              const sc=pool.map((t,k)=>[(t.a[0]-r)**2+(t.a[1]-g)**2+(t.a[2]-b)**2,k]).sort((p,q)=>p[0]-q[0]);
+              let pick=sc[Math.floor(Math.random()*3)][1];
+              if(pick===last[x])pick=sc[3][1];
+              last[x]=pick;
+              ox.drawImage(pool[pick].c,x*CS,y*CS,CS,CS);
+              ox.fillStyle=`rgba(${r},${g},${b},.28)`;ox.fillRect(x*CS,y*CS,CS,CS);
+            }
+            $('st').textContent=`Done: ${cols*rows} tiles from ${pool.length} random Commons images.`;
+            $('dl').disabled=false;
+          }
+          $('dl').onclick=()=>{const a=document.createElement('a');a.download='mosaic.png';a.href=$('out').toDataURL('image/png');a.click()};
+          </script>
+          </main></body></html>
+          EOF_HTML
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
