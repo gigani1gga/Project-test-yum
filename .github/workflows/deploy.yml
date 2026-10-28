@@ -59,36 +59,41 @@ jobs:
           </div>
 
           <div class="card">
-          <div class="m">Tiles across: <b id="tv">48</b></div>
-          <input id="tn" type="range" min="16" max="100" value="48">
-          <div class="m" style="margin-top:8px">Random images to fetch: <b id="pv">200</b></div>
-          <input id="pn" type="range" min="60" max="500" step="20" value="200">
+          <div class="m">Tiles across: <b id="tv">150</b> <span id="tc"></span></div>
+          <input id="tn" type="range" min="16" max="400" value="150">
+          <div class="m" style="margin-top:8px">Random images to fetch: <b id="pv">400</b></div>
+          <input id="pn" type="range" min="60" max="800" step="20" value="400">
           </div>
 
           <div class="card out"><canvas id="out" width="1" height="1"></canvas><p class="m" id="st">Waiting for a photo…</p></div>
 
           <script>
           const $=id=>document.getElementById(id);
-          const T=32,CS=20;
+          const T=32;
           let srcImg=null,pool=[];
 
-          $('tn').oninput=()=>$('tv').textContent=$('tn').value;
+          function upd(){
+            const c=+$('tn').value;$('tv').textContent=c;
+            const r=srcImg?Math.max(1,Math.round(c*srcImg.height/srcImg.width)):c;
+            $('tc').textContent='('+(c*r).toLocaleString()+' tiles)';
+          }
+          $('tn').oninput=upd;
           $('pn').oninput=()=>$('pv').textContent=$('pn').value;
           $('src').onchange=e=>{
             const f=e.target.files[0];if(!f)return;
             const i=new Image();
-            i.onload=()=>{srcImg=i;$('go').disabled=false;$('st').textContent='Photo loaded. Tap "Make mosaic".'};
+            i.onload=()=>{srcImg=i;$('go').disabled=false;$('st').textContent='Photo loaded. Tap "Make mosaic".';upd()};
             i.src=URL.createObjectURL(f);
           };
+          upd();
 
           function mk(){const c=document.createElement('canvas');c.width=c.height=T;return c}
           function avg(c){const d=c.getContext('2d').getImageData(0,0,T,T).data;let r=0,g=0,b=0,n=T*T;for(let i=0;i<d.length;i+=4){r+=d[i];g+=d[i+1];b+=d[i+2]}return[r/n,g/n,b/n]}
 
-          // Ask Commons for a batch of random JPEG files (thumbnails ~96px wide)
           async function fetchBatch(){
-            const u='https://commons.wikimedia.org/w/api.php?action=query&generator=random&grnnamespace=6&grnlimit=50'
-              +'&prop=imageinfo&iiprop=url|mime&iiurlwidth=96&format=json&origin=*';
-            const r=await fetch(u);
+            const u='https://commons.wikimedia.org/w/api.php?action=query&generator=random&grnnamespace=6&grnlimit=50&grnfilterredir=nonredirects'
+              +'&prop=imageinfo&iiprop=url|mime&iiurlwidth=96&format=json&origin=*&rnd='+Date.now()+'-'+Math.random();
+            const r=await fetch(u,{cache:'no-store'});
             if(!r.ok)throw new Error('API '+r.status);
             const j=await r.json();
             const pages=Object.values((j.query&&j.query.pages)||{});
@@ -113,10 +118,13 @@ jobs:
 
           async function fillPool(target){
             pool=[];
-            let fails=0;
-            while(pool.length<target&&fails<4){
+            const seen=new Set();
+            let fails=0,empty=0;
+            while(pool.length<target&&fails<4&&empty<8){
               try{
-                const urls=await fetchBatch();
+                const urls=(await fetchBatch()).filter(u=>!seen.has(u));
+                urls.forEach(u=>seen.add(u));
+                if(!urls.length){empty++;continue}
                 const tiles=(await Promise.all(urls.map(loadTile))).filter(Boolean);
                 pool.push(...tiles);
                 $('st').textContent=`Fetching random images… ${pool.length}/${target}`;
@@ -130,32 +138,59 @@ jobs:
             $('go').disabled=true;$('dl').disabled=true;
             try{
               await fillPool(+$('pn').value);
-              draw();
-            }catch(e){$('st').textContent=e.message}
+              await draw();
+            }catch(e){$('st').textContent=e.message;console.error(e)}
             $('go').disabled=false;
           };
 
-          function draw(){
+          async function draw(){
             const cols=+$('tn').value,rows=Math.max(1,Math.round(cols*srcImg.height/srcImg.width));
+            const cells=cols*rows;
+            // keep the output canvas under ~16 million pixels so phones can handle it
+            const CS=Math.max(4,Math.min(20,Math.floor(Math.sqrt(16e6/cells))));
             const s=document.createElement('canvas');s.width=cols;s.height=rows;
-            const sx=s.getContext('2d');sx.drawImage(srcImg,0,0,cols,rows);
+            const sx=s.getContext('2d');sx.imageSmoothingQuality='high';sx.drawImage(srcImg,0,0,cols,rows);
             const px=sx.getImageData(0,0,cols,rows).data;
             const o=$('out');o.width=cols*CS;o.height=rows*CS;
             const ox=o.getContext('2d');
-            const last=new Array(cols).fill(-1);
-            for(let y=0;y<rows;y++)for(let x=0;x<cols;x++){
-              const i=(y*cols+x)*4,r=px[i],g=px[i+1],b=px[i+2];
-              const sc=pool.map((t,k)=>[(t.a[0]-r)**2+(t.a[1]-g)**2+(t.a[2]-b)**2,k]).sort((p,q)=>p[0]-q[0]);
-              let pick=sc[Math.floor(Math.random()*3)][1];
-              if(pick===last[x])pick=sc[3][1];
-              last[x]=pick;
-              ox.drawImage(pool[pick].c,x*CS,y*CS,CS,CS);
-              ox.fillStyle=`rgba(${r},${g},${b},.28)`;ox.fillRect(x*CS,y*CS,CS,CS);
+            const n=pool.length;
+            const A=new Float32Array(n*3);
+            pool.forEach((t,k)=>{A[k*3]=t.a[0];A[k*3+1]=t.a[1];A[k*3+2]=t.a[2]});
+            const uses=new Int32Array(n);
+            const pen=1152/(cells/n); // spreads usage across many different images
+            for(let y=0;y<rows;y++){
+              for(let x=0;x<cols;x++){
+                const i=(y*cols+x)*4,r=px[i],g=px[i+1],b=px[i+2];
+                let b0=1e18,b1=1e18,b2=1e18,i0=0,i1=0,i2=0;
+                for(let k=0;k<n;k++){
+                  const dr=A[k*3]-r,dg=A[k*3+1]-g,db=A[k*3+2]-b;
+                  const d=dr*dr+dg*dg+db*db+pen*uses[k];
+                  if(d<b2){
+                    if(d<b1){
+                      b2=b1;i2=i1;
+                      if(d<b0){b1=b0;i1=i0;b0=d;i0=k}else{b1=d;i1=k}
+                    }else{b2=d;i2=k}
+                  }
+                }
+                const pick=[i0,i1,i2][Math.floor(Math.random()*3)];
+                uses[pick]++;
+                ox.drawImage(pool[pick].c,x*CS,y*CS,CS,CS);
+                ox.fillStyle=`rgba(${r},${g},${b},.28)`;ox.fillRect(x*CS,y*CS,CS,CS);
+              }
+              if(y%4===0){
+                $('st').textContent=`Building… ${Math.round(y/rows*100)}%`;
+                await new Promise(r=>setTimeout(r));
+              }
             }
-            $('st').textContent=`Done: ${cols*rows} tiles from ${pool.length} random Commons images.`;
+            let used=0;for(let k=0;k<n;k++)if(uses[k])used++;
+            $('st').textContent=`Done: ${cells.toLocaleString()} tiles using ${used} different random images (${o.width}×${o.height}px).`;
             $('dl').disabled=false;
           }
-          $('dl').onclick=()=>{const a=document.createElement('a');a.download='mosaic.png';a.href=$('out').toDataURL('image/png');a.click()};
+          $('dl').onclick=()=>{
+            $('out').toBlob(b=>{
+              const a=document.createElement('a');a.download='mosaic.png';a.href=URL.createObjectURL(b);a.click();
+            },'image/png');
+          };
           </script>
           </main></body></html>
           EOF_HTML
