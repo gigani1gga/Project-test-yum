@@ -22,6 +22,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Generate the site
+        env:
+          PIXABAY_KEY: ${{ secrets.PIXABAY_KEY }}
         run: |
           mkdir site
           cat > site/index.html <<'EOF_HTML'
@@ -47,9 +49,20 @@ jobs:
           .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
           .out{overflow-x:auto}
           canvas{max-width:100%;height:auto;border-radius:8px;display:block}
+          a{color:var(--acc)}
           </style></head><body><main>
           <h1>Internet Photo Mosaic</h1>
           <p class="s">Upload a photo and rebuild it out of images from the internet.</p>
+
+          <div class="card">
+          <div class="m" id="ks"></div>
+          <details style="margin-top:6px"><summary class="m">Use a different Pixabay key</summary>
+          <div class="row" style="margin-top:8px">
+          <input id="key" type="text" placeholder="Paste a key here" autocomplete="off" style="flex:1;min-width:180px">
+          <button id="sk" class="g">Save key</button>
+          </div>
+          </details>
+          </div>
 
           <div class="card">
           <div class="m" style="margin-bottom:6px">What should the tiles be? (leave empty for random)</div>
@@ -66,17 +79,28 @@ jobs:
           <div class="m">Tiles across: <b id="tv">100</b> <span id="tc"></span></div>
           <input id="tn" type="range" min="16" max="400" value="100">
           <div class="m" style="margin-top:8px">Images to fetch: <b id="pv">200</b></div>
-          <input id="pn" type="range" min="60" max="800" step="10" value="200">
+          <input id="pn" type="range" min="40" max="800" step="10" value="200">
           </div>
 
           <div class="card out"><canvas id="out" width="1" height="1"></canvas><p class="m" id="st">Waiting for a photo…</p></div>
 
           <script>
           const $=id=>document.getElementById(id);
-          const T=24,WORKERS=5;
-          const WORDS=['nature','city','flowers','animals','food','ocean','mountains','architecture','sky','forest','street','art','birds','cars','sunset','garden','market','bridge','desert','winter'];
+          const T=20,CONC=24;
+          const BUILTIN='__PIXABAY_KEY__';
+          const WORDS=['nature','city','flowers','animals','food','ocean','mountains','architecture','sky','forest','street','art','birds','cars','sunset','garden','market','bridge','desert','winter','beach','coffee','space','texture','fruit','lake','snow','autumn','dog','cat'];
           let srcImg=null,pool=[],poolKey=null;
           const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+          function builtin(){return BUILTIN.indexOf('__PIX')===0?'':BUILTIN}
+          function getKey(){let k='';try{k=localStorage.getItem('pxkey')||''}catch(e){}return k||builtin()}
+          function setKey(k){try{localStorage.setItem('pxkey',k)}catch(e){}}
+          function showKey(){
+            const k=getKey();
+            $('ks').textContent=k?(builtin()&&k===builtin()?'Pixabay key is built in. Pixabay will be used.':'Your saved key is set. Pixabay will be used.'):'No Pixabay key, so Wikimedia Commons will be used.';
+          }
+          $('sk').onclick=()=>{setKey($('key').value.trim());poolKey=null;showKey()};
+          showKey();
 
           function upd(){
             const c=+$('tn').value;$('tv').textContent=c;
@@ -117,12 +141,32 @@ jobs:
             });
           }
 
-          // Commons: search when there's a query, random otherwise
+          async function loadAll(urls,src,onTile){
+            let idx=0,ok=0;
+            const w=async()=>{
+              while(idx<urls.length){
+                const u=urls[idx++];
+                const t=await loadTile(u,src);
+                if(t){pool.push(t);ok++;onTile()}
+              }
+            };
+            await Promise.all(Array.from({length:Math.min(CONC,urls.length)},w));
+            return ok;
+          }
+
+          async function pixabayPage(key,q,page){
+            const u='https://pixabay.com/api/?key='+encodeURIComponent(key)+'&q='+encodeURIComponent(q)+'&image_type=photo&safesearch=true&per_page=200&page='+page;
+            const r=await fetch(u);
+            if(!r.ok){let t='';try{t=(await r.text()).slice(0,60)}catch(e){}throw new Error('Pixabay said '+r.status+' '+t)}
+            const j=await r.json();
+            return (j.hits||[]).map(h=>h.previewURL).filter(Boolean);
+          }
+
           async function commonsBatch(q,offset){
-            const base='https://commons.wikimedia.org/w/api.php?action=query&grnnamespace=6&prop=imageinfo&iiprop=url|mime&iiurlwidth=60&format=json&origin=*';
+            const base='https://commons.wikimedia.org/w/api.php?action=query&prop=imageinfo&iiprop=url|mime&iiurlwidth=60&format=json&origin=*';
             const u=q
-              ?base.replace('&grnnamespace=6','')+'&generator=search&gsrnamespace=6&gsrlimit=50&gsroffset='+offset+'&gsrsearch='+encodeURIComponent(q+' filetype:bitmap')
-              :base+'&generator=random&grnlimit=50&grnfilterredir=nonredirects&rnd='+Date.now()+'-'+Math.random();
+              ?base+'&generator=search&gsrnamespace=6&gsrlimit=50&gsroffset='+offset+'&gsrsearch='+encodeURIComponent(q+' filetype:bitmap')
+              :base+'&generator=random&grnnamespace=6&grnlimit=50&grnfilterredir=nonredirects&rnd='+Date.now()+'-'+Math.random();
             const r=await fetch(u,{cache:'no-store'});
             if(!r.ok)throw new Error('Commons '+r.status);
             const j=await r.json();
@@ -134,32 +178,36 @@ jobs:
             pool=[];
             const seen=new Set();
             const t0=performance.now();
-            const status=m=>{$('st').textContent=`${m} ${Math.min(pool.length,target)}/${target} (${Math.round((performance.now()-t0)/1000)}s)`};
+            const status=m=>{
+              const s=(performance.now()-t0)/1000;
+              $('st').textContent=`${m} ${Math.min(pool.length,target)}/${target} (${s.toFixed(0)}s, ${(pool.length/Math.max(s,.1)).toFixed(0)} images/sec)`;
+            };
+            let msg='';
 
-            // Phase 1: Openverse (20 per request, about 1 request per second when anonymous)
-            let ovOk=true,ovMsg='';
-            const words=q?[q]:WORDS.slice().sort(()=>Math.random()-.5).slice(0,6);
-            for(const w of words){
-              if(!ovOk||pool.length>=target)break;
-              for(let p=1;p<=5&&pool.length<target;p++){
-                try{
-                  const r=await fetch('https://api.openverse.org/v1/images/?q='+encodeURIComponent(w)+'&page_size=20&page='+p+'&mature=false');
-                  if(!r.ok){ovOk=false;ovMsg='Openverse said '+r.status;break}
-                  const j=await r.json();
-                  const res=j.results||[];
-                  if(!res.length)break;
-                  const urls=res.map(x=>x.thumbnail||x.url).filter(u=>u&&!seen.has(u));
+            const key=getKey();
+            if(key){
+              try{
+                const jobs=[];
+                if(q){for(let p=1;p<=Math.min(3,Math.ceil(target/200));p++)jobs.push([q,p])}
+                else{
+                  const ws=WORDS.slice().sort(()=>Math.random()-.5);
+                  const n=Math.ceil(target/150)+1;
+                  for(let i=0;i<n&&i<ws.length;i++)jobs.push([ws[i],1+Math.floor(Math.random()*2)]);
+                }
+                for(let i=0;i<jobs.length&&pool.length<target;i+=3){
+                  const chunk=jobs.slice(i,i+3);
+                  const lists=await Promise.all(chunk.map(j=>pixabayPage(key,j[0],j[1])));
+                  let urls=[].concat(...lists).filter(u=>!seen.has(u));
+                  urls=[...new Set(urls)].slice(0,target-pool.length+40);
                   urls.forEach(u=>seen.add(u));
-                  const tiles=(await Promise.all(urls.map(u=>loadTile(u,'ov')))).filter(Boolean);
-                  pool.push(...tiles);
-                  status('Openverse…');
-                  if(p===1&&!tiles.length&&urls.length){ovOk=false;ovMsg='Openverse images blocked by the browser';break}
-                  await sleep(1100);
-                }catch(e){ovOk=false;ovMsg='Openverse unreachable';break}
-              }
-            }
+                  status('Pixabay…');
+                  const before=pool.length;
+                  const ok=await loadAll(urls,'px',()=>{if(pool.length%10===0)status('Pixabay…')});
+                  if(!ok&&urls.length&&before===0){msg='Pixabay images were blocked by the browser';break}
+                }
+              }catch(e){msg=e.message;console.error(e)}
+            }else msg='No Pixabay key';
 
-            // Phase 2: Commons fills whatever is left
             if(pool.length<target){
               let fails=0,empty=0,offset=0;
               const worker=async()=>{
@@ -169,13 +217,11 @@ jobs:
                     const urls=(await commonsBatch(q,off)).filter(u=>!seen.has(u));
                     urls.forEach(u=>seen.add(u));
                     if(!urls.length){empty++;continue}
-                    const tiles=(await Promise.all(urls.map(u=>loadTile(u,'wc')))).filter(Boolean);
-                    pool.push(...tiles);
-                    status(ovMsg?ovMsg+'. Using Wikimedia Commons…':'Adding Wikimedia Commons…');
+                    await Promise.all(urls.map(u=>loadTile(u,'wc').then(t=>{if(t){pool.push(t);if(pool.length%10===0)status(msg?msg+'. Wikimedia…':'Wikimedia…')}})));
                   }catch(e){fails++;console.error(e)}
                 }
               };
-              await Promise.all(Array.from({length:WORKERS},worker));
+              await Promise.all(Array.from({length:8},worker));
             }
             if(pool.length<20)throw new Error('Could not find enough images'+(q?' for "'+q+'". Try a broader search word.':'. Check your connection and try again.'));
           }
@@ -184,8 +230,8 @@ jobs:
             if(!srcImg)return;
             $('go').disabled=true;$('nw').disabled=true;$('dl').disabled=true;
             try{
-              const q=$('q').value.trim().toLowerCase(),target=+$('pn').value,key=q;
-              if(force||key!==poolKey||pool.length<target){await fillPool(target,q);poolKey=key}
+              const q=$('q').value.trim().toLowerCase(),target=+$('pn').value,key=q+'|'+getKey();
+              if(force||key!==poolKey||pool.length<target*0.8){await fillPool(target,q);poolKey=key}
               await draw();
             }catch(e){$('st').textContent=e.message;console.error(e);poolKey=null}
             $('go').disabled=false;$('nw').disabled=false;
@@ -243,10 +289,10 @@ jobs:
                 tm=performance.now();
               }
             }
-            let used=0,ov=0,wc=0;
+            let used=0,px_=0,wc=0;
             for(let k=0;k<n;k++){if(uses[k]){used++}}
-            pool.forEach(t=>{if(t.src==='ov')ov++;else wc++});
-            $('st').textContent=`Done: ${cells.toLocaleString()} tiles using ${used} different images (${ov} from Openverse, ${wc} from Wikimedia Commons in the pool). ${o.width}×${o.height}px.`;
+            pool.forEach(t=>{if(t.src==='px')px_++;else wc++});
+            $('st').textContent=`Done: ${cells.toLocaleString()} tiles using ${used} different images (pool: ${px_} Pixabay, ${wc} Wikimedia Commons). ${o.width}×${o.height}px.`;
             $('dl').disabled=false;
           }
           $('dl').onclick=()=>{
@@ -257,6 +303,7 @@ jobs:
           </script>
           </main></body></html>
           EOF_HTML
+          sed -i "s/__PIXABAY_KEY__/${PIXABAY_KEY}/" site/index.html
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
