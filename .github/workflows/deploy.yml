@@ -45,8 +45,9 @@ jobs:
           button:disabled{opacity:.5;cursor:default}
           input[type=file]{display:none}
           input[type=range]{width:100%;accent-color:var(--acc)}
-          input[type=text]{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);font:inherit}
+          input[type=text],select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);font:inherit}
           .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+          .half{flex:1;min-width:140px}
           .out{overflow-x:auto}
           canvas{max-width:100%;height:auto;border-radius:8px;display:block}
           a{color:var(--acc)}
@@ -71,7 +72,7 @@ jobs:
           <label class="b">Choose photo<input id="src" type="file" accept="image/*"></label>
           <button id="go" disabled>Make mosaic</button>
           <button id="nw" class="g" disabled>New images</button>
-          <button id="dl" class="g" disabled>Download PNG</button>
+          <button id="dl" class="g" disabled>Download</button>
           </div>
           </div>
 
@@ -80,13 +81,19 @@ jobs:
           <input id="tn" type="range" min="16" max="400" value="100">
           <div class="m" style="margin-top:8px">Images to fetch: <b id="pv">200</b></div>
           <input id="pn" type="range" min="40" max="800" step="10" value="200">
+          <div class="row" style="margin-top:12px">
+          <div class="half"><div class="m">Output size</div>
+          <select id="sz"><option value="2000000">Small (fastest)</option><option value="6000000" selected>Medium</option><option value="16000000">Large (heavy)</option></select></div>
+          <div class="half"><div class="m">Download as</div>
+          <select id="fm"><option value="jpg" selected>JPEG (small file)</option><option value="png">PNG (big file)</option></select></div>
+          </div>
           </div>
 
           <div class="card out"><canvas id="out" width="1" height="1"></canvas><p class="m" id="st">Waiting for a photo…</p></div>
 
           <script>
           const $=id=>document.getElementById(id);
-          const T=20,CONC=24;
+          const T=20,CONC=24,MAXSRC=1200;
           const BUILTIN='__PIXABAY_KEY__';
           const WORDS=['nature','city','flowers','animals','food','ocean','mountains','architecture','sky','forest','street','art','birds','cars','sunset','garden','market','bridge','desert','winter','beach','coffee','space','texture','fruit','lake','snow','autumn','dog','cat'];
           let srcImg=null,pool=[],poolKey=null;
@@ -110,10 +117,21 @@ jobs:
           $('tn').oninput=upd;
           $('pn').oninput=()=>$('pv').textContent=$('pn').value;
           $('q').onkeydown=e=>{if(e.key==='Enter'&&srcImg){e.preventDefault();run()}};
+
+          // Shrink big phone photos right away so everything after is lighter
           $('src').onchange=e=>{
             const f=e.target.files[0];if(!f)return;
             const i=new Image();
-            i.onload=()=>{srcImg=i;$('go').disabled=false;$('nw').disabled=false;$('st').textContent='Photo loaded. Tap "Make mosaic".';upd()};
+            i.onload=()=>{
+              const k=Math.min(1,MAXSRC/Math.max(i.width,i.height));
+              const c=document.createElement('canvas');
+              c.width=Math.max(1,Math.round(i.width*k));c.height=Math.max(1,Math.round(i.height*k));
+              const x=c.getContext('2d');x.imageSmoothingQuality='high';x.drawImage(i,0,0,c.width,c.height);
+              URL.revokeObjectURL(i.src);
+              srcImg=c;
+              $('go').disabled=false;$('nw').disabled=false;
+              $('st').textContent='Photo loaded. Tap "Make mosaic".';upd();
+            };
             i.src=URL.createObjectURL(f);
           };
           upd();
@@ -242,7 +260,8 @@ jobs:
           async function draw(){
             const cols=+$('tn').value,rows=Math.max(1,Math.round(cols*srcImg.height/srcImg.width));
             const cells=cols*rows;
-            const CS=Math.max(4,Math.min(20,Math.floor(Math.sqrt(16e6/cells))));
+            const maxPx=+$('sz').value;
+            const CS=Math.max(4,Math.min(20,Math.floor(Math.sqrt(maxPx/cells))));
             const s=document.createElement('canvas');s.width=cols;s.height=rows;
             const sx=s.getContext('2d');sx.imageSmoothingQuality='high';sx.drawImage(srcImg,0,0,cols,rows);
             const px=sx.getImageData(0,0,cols,rows).data;
@@ -295,10 +314,15 @@ jobs:
             $('st').textContent=`Done: ${cells.toLocaleString()} tiles using ${used} different images (pool: ${px_} Pixabay, ${wc} Wikimedia Commons). ${o.width}×${o.height}px.`;
             $('dl').disabled=false;
           }
+
           $('dl').onclick=()=>{
+            const jpg=$('fm').value==='jpg';
             $('out').toBlob(b=>{
-              const a=document.createElement('a');a.download='mosaic.png';a.href=URL.createObjectURL(b);a.click();
-            },'image/png');
+              const a=document.createElement('a');
+              a.download=jpg?'mosaic.jpg':'mosaic.png';
+              a.href=URL.createObjectURL(b);a.click();
+              $('st').textContent+=` Saved ${(b.size/1048576).toFixed(1)} MB.`;
+            },jpg?'image/jpeg':'image/png',0.85);
           };
           </script>
           </main></body></html>
